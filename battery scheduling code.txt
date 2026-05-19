@@ -1,0 +1,143 @@
+# ============================================
+#  BATTERY SCHEDULING CODE
+# MD.Toriqul Islam Srestho
+# Generates 4 figures (fig1-4)
+# ============================================
+
+!pip install pulp -q
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import linprog
+
+# --- 1. DATA ---
+HOURS = np.arange(24)
+P_load = np.array([0.5,0.4,0.4,0.5,0.6,0.8,1.2,1.5,1.0,0.8,0.8,0.8,0.9,0.9,1.0,1.2,1.8,2.5,3.0,2.8,2.0,1.5,1.0,0.6])
+P_pv = np.array([0.0,0.0,0.0,0.0,0.0,0.2,0.8,1.5,2.5,3.5,4.0,4.2,4.0,3.5,2.5,1.5,0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+
+# --- 2. BASELINE ---
+def run_baseline(P_load, P_pv, price, SOC_min, SOC_max, SOC_init, P_ch_max, P_dis_max, eta_c, eta_d):
+    SOC = SOC_init
+    SOC_traj = np.zeros(25)
+    SOC_traj[0] = SOC_init
+    P_grid = np.zeros(24)
+    for t in range(24):
+        net = P_pv[t] - P_load[t]
+        if net > 0:
+            P_ch = min(net, P_ch_max)
+            space = (SOC_max - SOC) / eta_c
+            P_ch = min(P_ch, space)
+            SOC += P_ch * eta_c
+            P_grid[t] = 0.0
+        else:
+            deficit = -net
+            P_dis = min(deficit, P_dis_max)
+            energy_avail = (SOC - SOC_min) * eta_d
+            P_dis = min(P_dis, energy_avail)
+            SOC -= P_dis / eta_d
+            P_grid[t] = deficit - P_dis
+        SOC_traj[t+1] = SOC
+    return np.sum(P_grid * price), SOC_traj, P_grid
+
+# --- 3. LP OPTIMIZER ---
+def run_optimized(P_load, P_pv, price, SOC_min, SOC_max, SOC_init, P_ch_max, P_dis_max, eta_c, eta_d, final_SOC_bound=None):
+    T = 24
+    n_vars = 5 * T
+    c = np.zeros(n_vars)
+    for t in range(T): c[t] = price[t]
+    A_eq, b_eq = [], []
+    for t in range(T):
+        row = np.zeros(n_vars)
+        row[t] = 1; row[T+t] = -1; row[2*T+t] = 1; row[3*T+t] = 1
+        A_eq.append(row); b_eq.append(P_load[t])
+    row = np.zeros(n_vars)
+    row[T] = -eta_c; row[2*T] = 1/eta_d; row[4*T] = 1
+    A_eq.append(row); b_eq.append(SOC_init)
+    for t in range(1,T):
+        row = np.zeros(n_vars)
+        row[T+t] = -eta_c; row[2*T+t] = 1/eta_d; row[4*T+t-1] = -1; row[4*T+t] = 1
+        A_eq.append(row); b_eq.append(0)
+    A_eq, b_eq = np.array(A_eq), np.array(b_eq)
+    bounds = [(0,None)]*T + [(0,P_ch_max)]*T + [(0,P_dis_max)]*T + [(0,P_pv[t]) for t in range(T)] + [(SOC_min,SOC_max)]*T
+    A_ub, b_ub = (None, None)
+    if final_SOC_bound is not None:
+        A_ub = np.zeros((1,n_vars)); A_ub[0,4*T+T-1] = -1; b_ub = np.array([-final_SOC_bound])
+    res = linprog(c, A_eq=A_eq, b_eq=b_eq, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    if res.success:
+        x = res.x
+        return res.fun, np.concatenate([[SOC_init], x[4*T:5*T]]), x[0:T]
+    return None, None, None
+
+# --- 4. RUN SCENARIOS ---
+price_mild = np.array([0.15]*6 + [0.25]*11 + [0.45]*5 + [0.15]*2)
+price_strong = np.array([0.12]*5 + [0.28]*11 + [0.58]*6 + [0.12]*2)
+
+base_A, soc_base_A, _ = run_baseline(P_load, P_pv, price_mild, 1.0, 4.5, 2.5, 1.5, 1.5, 0.95, 0.95)
+opt_A, soc_opt_A, _ = run_optimized(P_load, P_pv, price_mild, 1.0, 4.5, 2.5, 1.5, 1.5, 0.95, 0.95)
+opt_B, soc_opt_B, _ = run_optimized(P_load, P_pv, price_mild, 1.0, 4.5, 2.5, 1.5, 1.5, 0.95, 0.95, final_SOC_bound=2.5)
+base_C, _, _ = run_baseline(P_load, P_pv, price_strong, 1.5, 6.75, 4.0, 3.0, 3.0, 0.95, 0.95)
+opt_C, _, _ = run_optimized(P_load, P_pv, price_strong, 1.5, 6.75, 4.0, 3.0, 3.0, 0.95, 0.95)
+
+print(f"A: Base=${base_A:.3f} Opt=${opt_A:.3f} Save={((base_A-opt_A)/base_A)*100:.2f}%")
+print(f"B: Base=${base_A:.3f} Opt=${opt_B:.3f} Save={((base_A-opt_B)/base_A)*100:.2f}%")
+print(f"C: Base=${base_C:.3f} Opt=${opt_C:.3f} Save={((base_C-opt_C)/base_C)*100:.2f}%")
+
+# --- 5. FIGURE 1: System Profiles + SOC ---
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8,6.5), sharex=True)
+ax1.plot(HOURS, P_load, 'r--', marker='o', markersize=5, label='Load (kW)')
+ax1.plot(HOURS, P_pv, 'g-', marker='s', markersize=5, label='PV Gen (kW)')
+ax1.set_ylabel('Power (kW)', fontsize=11); ax1.set_title('24-Hour System Profiles', fontsize=12, fontweight='bold')
+ax1.legend(loc='upper left', fontsize=9); ax1.grid(True, alpha=0.3); ax1.set_xlim(-0.5, 23.5)
+ax2.plot(HOURS, soc_base_A[:-1], 'k:', linewidth=1.5, label='Baseline SOC')
+ax2.plot(HOURS, soc_opt_A[:-1], 'darkgreen', linewidth=2.2, label='Optimized SOC')
+ax2.axhline(4.5, color='r', linestyle='--', alpha=0.5); ax2.axhline(1.0, color='r', linestyle='--', alpha=0.5)
+ax2.set_xlabel('Hour of the Day', fontsize=11); ax2.set_ylabel('State of Charge (kWh)', fontsize=11)
+ax2.set_title('Battery SOC Trajectory', fontsize=12, fontweight='bold')
+ax2.legend(loc='lower left', fontsize=9); ax2.grid(True, alpha=0.3); ax2.set_xlim(-0.5, 23.5)
+plt.tight_layout(); plt.savefig('fig1.png', dpi=300, bbox_inches='tight'); plt.show()
+
+# --- 6. FIGURE 2: Bar Chart ---
+plt.figure(figsize=(6,4.5))
+cases = ['Baseline', 'Optimized\n(No Bound)', 'Optimized\n(With Bound)']
+costs = [base_A, opt_A, opt_B]
+colors = ['gray', 'teal', 'lightblue']
+bars = plt.bar(cases, costs, color=colors, width=0.5, edgecolor='black', linewidth=0.5)
+plt.ylabel('Daily Electricity Cost ($)', fontsize=11); plt.title('Economic Performance (5 kWh Battery)', fontsize=12, fontweight='bold')
+plt.ylim(0, max(costs)*1.3)
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x()+bar.get_width()/2.0, yval+0.08, f"${yval:.3f}", ha='center', va='bottom', fontweight='bold', fontsize=10)
+plt.tight_layout(); plt.savefig('fig2.png', dpi=300, bbox_inches='tight'); plt.show()
+
+# --- 7. FIGURE 3: Sensitivity ---
+capacities = [3, 5, 7.5, 10, 12]
+savings = []
+for cap in capacities:
+    smin, smax, sinit = cap*0.2, cap*0.9, cap*0.5
+    pmax = min(cap*0.4, 3.0)
+    bc, _, _ = run_baseline(P_load, P_pv, price_strong, smin, smax, sinit, pmax, pmax, 0.95, 0.95)
+    oc, _, _ = run_optimized(P_load, P_pv, price_strong, smin, smax, sinit, pmax, pmax, 0.95, 0.95)
+    savings.append(((bc-oc)/bc)*100)
+plt.figure(figsize=(5,3.5)); plt.plot(capacities, savings, 'bo-', markersize=7, linewidth=2)
+plt.xlabel('Battery Capacity (kWh)', fontsize=10); plt.ylabel('Savings (%)', fontsize=10)
+plt.title('Cost Savings vs. Battery Capacity', fontsize=11, fontweight='bold')
+plt.grid(True, alpha=0.3); plt.ylim(0, max(savings)*1.2); plt.tight_layout()
+plt.savefig('fig3.png', dpi=300, bbox_inches='tight'); plt.show()
+
+# --- 8. FIGURE 4: Tariffs ---
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8,5.5), sharex=True)
+ax1.step(HOURS, price_mild, where='mid', color='teal', linewidth=2.5, label='Mild Tariff')
+ax1.fill_between(HOURS, price_mild, step='mid', alpha=0.3, color='teal')
+ax1.set_ylabel('Price ($/kWh)', fontsize=11); ax1.set_title('Time-of-Use Electricity Tariffs', fontsize=12, fontweight='bold')
+ax1.legend(loc='upper left', fontsize=9); ax1.grid(True, alpha=0.3); ax1.set_ylim(0,0.55)
+for h,p in [(0,0.15),(6,0.25),(17,0.45),(22,0.15)]: ax1.annotate(f'${p:.2f}', xy=(h,p), xytext=(h+0.5,p+0.03), fontsize=9)
+ax2.step(HOURS, price_strong, where='mid', color='darkblue', linewidth=2.5, label='Strong Tariff')
+ax2.fill_between(HOURS, price_strong, step='mid', alpha=0.3, color='darkblue')
+ax2.set_xlabel('Hour of the Day', fontsize=11); ax2.set_ylabel('Price ($/kWh)', fontsize=11)
+ax2.legend(loc='upper left', fontsize=9); ax2.grid(True, alpha=0.3); ax2.set_ylim(0,0.65)
+for h,p in [(0,0.12),(5,0.28),(16,0.58),(22,0.12)]: ax2.annotate(f'${p:.2f}', xy=(h,p), xytext=(h+0.5,p+0.03), fontsize=9)
+plt.tight_layout(); plt.savefig('fig4_tariffs.png', dpi=300, bbox_inches='tight'); plt.show()
+
+print("\n✅ ALL 4 FIGURES GENERATED")
+print("Download: fig1.png, fig2.png, fig3.png, fig4_tariffs.png")
+print("Combined with 3 tables in LaTeX = 7 visual elements (NHSJS requires 5+)")
